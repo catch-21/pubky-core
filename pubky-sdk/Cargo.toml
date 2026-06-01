@@ -54,6 +54,7 @@ reqwest = { workspace = true, features = [
     "rustls",
     "json",
     "stream",
+    "socks",
 ] }
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true

@@ -145,6 +145,14 @@ public_icann_http_port = 80
 # a reverse proxy and managing certificates yourself.
 icann_domain = "localhost"
 
+# Tor v3 hidden-service hostname (optional). Requires a system Tor daemon — not bundled
+# with the homeserver. Map HiddenServicePort to icann_listen_socket (e.g. 80 -> 127.0.0.1:6286).
+# tor_onion = "your56charbase32hostnamexxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion"
+# Or read from Tor's hostname file:
+# tor_onion_file = "/var/lib/tor/pubky-homeserver/hostname"
+# public_onion_http_port = 80
+# endpoint_mode = "hybrid"  # or "tor_only" (omit direct SVCB + A; requires tor_onion)
+
 # The interval at which user keys are republished to the DHT.
 # 0 means disabled.
 user_keys_republisher_interval = 14400 # 4 hours in seconds

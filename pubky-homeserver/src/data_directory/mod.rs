@@ -9,6 +9,8 @@ mod config_toml;
 mod data_dir;
 mod domain;
 mod domain_port;
+mod onion_address;
+mod pkdns_endpoint_mode;
 #[cfg(any(test, feature = "testing"))]
 mod mock_data_dir;
 mod persistent_data_dir;
@@ -20,11 +22,13 @@ pub mod storage_config;
 
 mod log_level;
 pub use config_toml::{
-    AdminToml, ConfigReadError, ConfigToml, DefaultQuotasToml, LoggingToml, MetricsToml,
+    AdminToml, ConfigReadError, ConfigToml, DefaultQuotasToml, LoggingToml, MetricsToml, PkdnsToml,
 };
 pub use data_dir::DataDir;
 pub use domain::Domain;
 pub use domain_port::DomainPort;
+pub use onion_address::OnionAddress;
+pub use pkdns_endpoint_mode::PkdnsEndpointMode;
 #[cfg(any(test, feature = "testing"))]
 pub use mock_data_dir::MockDataDir;
 pub use persistent_data_dir::PersistentDataDir;

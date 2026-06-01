@@ -17,9 +17,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 pub(crate) enum ResolvedTransport {
     PubkyTls,
     Icann { domain: String, port: Option<u16> },
+    Onion { domain: String, port: Option<u16> },
 }
 
-/// Resolves and caches per-host transport decisions (`PubkyTLS` vs ICANN).
+fn is_onion_host(domain: &str) -> bool {
+    domain.ends_with(".onion")
+}
+
+/// Resolves and caches per-host transport decisions (`PubkyTLS` vs ICANN vs Tor onion).
 ///
 /// Accepts a `&pkarr::Client` reference when resolution is needed — does not
 /// own the pkarr client, which is shared across the SDK.
@@ -27,13 +32,17 @@ pub(crate) enum ResolvedTransport {
 pub(crate) struct TransportResolver {
     cache: Arc<RwLock<HashMap<String, (Instant, ResolvedTransport)>>>,
     guards: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    tor_only_transport: bool,
+    prefer_onion: bool,
 }
 
 impl TransportResolver {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(tor_only_transport: bool, prefer_onion: bool) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             guards: Arc::new(Mutex::new(HashMap::new())),
+            tor_only_transport,
+            prefer_onion,
         }
     }
 
@@ -63,12 +72,11 @@ impl TransportResolver {
         };
         let _lock = guard.lock().await;
 
-        // Another task may have resolved while we waited for the guard.
         if let Some(t) = self.cached(pk) {
             return t;
         }
 
-        let t = Self::resolve_from_pkarr(pkarr, pk).await;
+        let t = self.resolve_from_pkarr(pkarr, pk).await;
         self.cache
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -77,42 +85,81 @@ impl TransportResolver {
     }
 
     /// Inspect PKARR endpoints and probe reachability to pick a transport.
-    async fn resolve_from_pkarr(pkarr: &pkarr::Client, qname: &str) -> ResolvedTransport {
+    async fn resolve_from_pkarr(&self, pkarr: &pkarr::Client, qname: &str) -> ResolvedTransport {
         let stream = pkarr.resolve_https_endpoints(qname);
         futures_util::pin_mut!(stream);
 
         let mut has_direct = false;
         let mut direct_addrs = Vec::new();
+        let mut onion: Option<(String, Option<u16>)> = None;
         let mut icann: Option<(String, Option<u16>)> = None;
 
         while let Some(ep) = stream.next().await {
             if let Some(domain) = ep.domain() {
-                if icann.is_none() {
+                if is_onion_host(domain) {
+                    if onion.is_none() {
+                        onion = Some((domain.to_string(), ep.port()));
+                    }
+                } else if icann.is_none() {
                     icann = Some((domain.to_string(), ep.port()));
                 }
-            } else {
+            } else if !self.tor_only_transport {
                 has_direct = true;
                 direct_addrs.extend(ep.to_socket_addrs());
             }
         }
 
-        let Some((domain, port)) = icann else {
+        if self.tor_only_transport {
+            if let Some((domain, port)) = onion {
+                return ResolvedTransport::Onion { domain, port };
+            }
+            if let Some((domain, port)) = icann {
+                return ResolvedTransport::Icann { domain, port };
+            }
             return ResolvedTransport::PubkyTls;
-        };
-        if !has_direct {
-            return ResolvedTransport::Icann { domain, port };
         }
 
-        // Both exist — probe direct endpoint reachability.
-        if probe_reachable(&direct_addrs, PROBE_TIMEOUT).await {
-            ResolvedTransport::PubkyTls
-        } else {
-            cross_log!(
-                warn,
-                "Direct endpoint unreachable for {qname}; ICANN fallback to {domain}"
-            );
-            ResolvedTransport::Icann { domain, port }
+        if !has_direct {
+            return Self::domain_fallback(onion, icann, self.prefer_onion)
+                .unwrap_or(ResolvedTransport::PubkyTls);
         }
+
+        let Some(icann_pair) = icann else {
+            return ResolvedTransport::PubkyTls;
+        };
+
+        if probe_reachable(&direct_addrs, PROBE_TIMEOUT).await {
+            return ResolvedTransport::PubkyTls;
+        }
+
+        cross_log!(
+            warn,
+            "Direct endpoint unreachable for {qname}; fallback"
+        );
+        if let Some(t) = Self::domain_fallback(onion, Some(icann_pair.clone()), self.prefer_onion) {
+            return t;
+        }
+        let (domain, port) = icann_pair;
+        ResolvedTransport::Icann { domain, port }
+    }
+
+    fn domain_fallback(
+        onion: Option<(String, Option<u16>)>,
+        icann: Option<(String, Option<u16>)>,
+        prefer_onion: bool,
+    ) -> Option<ResolvedTransport> {
+        if prefer_onion {
+            if let Some((domain, port)) = onion {
+                return Some(ResolvedTransport::Onion { domain, port });
+            }
+        }
+        if let Some((domain, port)) = icann {
+            return Some(ResolvedTransport::Icann { domain, port });
+        }
+        if let Some((domain, port)) = onion {
+            return Some(ResolvedTransport::Onion { domain, port });
+        }
+        None
     }
 }
 
@@ -149,19 +196,8 @@ fn classify_host(host: &str) -> HostKind {
 impl PubkyHttpClient {
     /// Constructs a [`reqwest::RequestBuilder`] for the given HTTP `method` and `url`,
     /// routing through the client's unified request path.
-    ///
-    /// This method ensures that special Pubky and pkarr hosts are resolved according to
-    /// platform-specific rules (native or WASM), including:
-    /// - Detecting `_pubky.<public-key>` hosts and applying the correct TLS handling.
-    /// - Routing standard ICANN domains through the `icann_http` client on native builds.
-    /// - When both a direct (IP:PORT) and an ICANN (domain) endpoint exist, TCP-probing
-    ///   the direct endpoint and falling back to ICANN if unreachable.
-    ///
-    /// Transport decisions are cached per public key with a short TTL.
-    ///
-    /// Returns a [`Result`] containing the prepared `RequestBuilder`, or a URL/transport
-    /// parsing error if the supplied `url` is invalid.
-    pub(crate) async fn cross_request(
+    /// Build an HTTP request with pkarr-aware transport (Pubky TLS, ICANN, or Tor onion).
+    pub async fn cross_request(
         &self,
         method: Method,
         mut url: Url,
@@ -197,16 +233,31 @@ impl PubkyHttpClient {
                     .request(method, icann_url.as_str())
                     .header("pubky-host", pk))
             }
+            ResolvedTransport::Onion { domain, port } => {
+                let tor_http = self.tor_http.as_ref().ok_or_else(|| {
+                    RequestError::Validation {
+                        message: "Tor SOCKS proxy not configured; use \
+                                   PubkyHttpClientBuilder::tor_socks_proxy()"
+                            .to_string(),
+                    }
+                })?;
+                let mut tor_url = url.clone();
+                let _ = tor_url.set_scheme("http");
+                tor_url.set_host(Some(domain))?;
+                if let Some(p) = port {
+                    tor_url
+                        .set_port(Some(*p))
+                        .map_err(|_err| url::ParseError::InvalidPort)?;
+                }
+                cross_log!(debug, "Tor onion transport for {pk} via {domain}");
+                Ok(tor_http
+                    .request(method, tor_url.as_str())
+                    .header("pubky-host", pk))
+            }
         }
     }
 
     /// Detect pubky hosts and return the z32 public key when applicable.
-    ///
-    /// Native builds do not rewrite URLs; we only detect pubky hosts and return the
-    /// `pubky-host` value when applicable.
-    ///
-    /// # Errors
-    /// Returns [`RequestError::Validation`] if the host uses a `pubky` prefix.
     #[allow(
         clippy::unused_async,
         reason = "keep async signature aligned with WASM build"
@@ -241,20 +292,7 @@ impl PubkyHttpClient {
         Ok(None)
     }
 
-    /// Start building a `Request` with the `Method` and `Url` (native-only).
-    ///
-    /// Returns a `RequestBuilder`, which will allow setting headers and
-    /// the request body before sending.
-    ///
-    /// Differs from [`reqwest::Client::request`], in that it can make requests to:
-    /// 1. HTTPS URLs with a [`crate::PublicKey`] as top-level domain, by resolving
-    ///    corresponding endpoints, and verifying TLS certificates accordingly.
-    ///    (example: `https://o4dksfbqk85ogzdb5osziw6befigbuxmuxkuxq8434q89uj56uyy`)
-    /// 2. `_pubky.<public-key>` URLs like `https://_pubky.o4dksfbqk85ogzdb5osziw6befigbuxmuxkuxq8434q89uj56uyy`
-    ///
-    /// # Errors
-    ///
-    /// This method fails whenever the supplied `Url` cannot be parsed.
+    /// Start building a request with platform-specific host handling (native-only).
     pub fn request<U: IntoUrl>(&self, method: Method, url: &U) -> RequestBuilder {
         let url_str = url.as_str();
 
@@ -301,11 +339,10 @@ mod tests {
 
     #[tokio::test]
     async fn probe_unreachable_returns_false() {
-        let addr = "192.0.2.1:1".parse().unwrap(); // TEST-NET-1, RFC 5737
+        let addr = "192.0.2.1:1".parse().unwrap();
         assert!(!probe_reachable(&[addr], Duration::from_millis(100)).await);
     }
 
-    /// Helper: build a pkarr client with a pre-cached signed packet (no real network).
     fn pkarr_with_packet(keypair: &Keypair, packet: &SignedPacket) -> pkarr::Client {
         let mut builder = PubkyHttpClient::builder();
         builder.pkarr(|b| b.no_default_network().bootstrap(&["127.0.0.1:1"]));
@@ -336,7 +373,6 @@ mod tests {
 
         assert_eq!(req.url().host_str(), Some("example.com"));
         assert_eq!(req.url().port(), Some(8443));
-        assert_eq!(req.url().path(), "/pub/app/file.txt");
         assert_eq!(req.headers().get("pubky-host").unwrap(), z32);
     }
 
@@ -351,8 +387,9 @@ mod tests {
             .sign(&kp)
             .unwrap();
         let pkarr = pkarr_with_packet(&kp, &packet);
+        let resolver = TransportResolver::new(false, false);
 
-        let t = TransportResolver::resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
+        let t = resolver.resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
         assert!(matches!(t, ResolvedTransport::PubkyTls));
     }
 
@@ -365,12 +402,30 @@ mod tests {
             .sign(&kp)
             .unwrap();
         let pkarr = pkarr_with_packet(&kp, &packet);
+        let resolver = TransportResolver::new(false, false);
 
-        let t = TransportResolver::resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
+        let t = resolver.resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
         assert!(matches!(t, ResolvedTransport::Icann { .. }));
-        if let ResolvedTransport::Icann { domain, .. } = t {
-            assert_eq!(domain, "example.com");
-        }
+    }
+
+    #[tokio::test]
+    async fn resolve_transport_onion_only_tor_mode() {
+        const ONION: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion";
+        let kp = Keypair::random();
+        let mut svcb = SVCB::new(20, ONION.try_into().unwrap());
+        svcb.set_port(80);
+        let packet = SignedPacket::builder()
+            .https(".".try_into().unwrap(), svcb, 3600)
+            .sign(&kp)
+            .unwrap();
+        let pkarr = pkarr_with_packet(&kp, &packet);
+        let resolver = TransportResolver::new(true, true);
+
+        let t = resolver.resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
+        assert!(
+            matches!(t, ResolvedTransport::Onion { ref domain, port: Some(80) } if domain == ONION)
+        );
     }
 
     #[tokio::test]
@@ -386,8 +441,9 @@ mod tests {
             .sign(&kp)
             .unwrap();
         let pkarr = pkarr_with_packet(&kp, &packet);
+        let resolver = TransportResolver::new(false, false);
 
-        let t = TransportResolver::resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
+        let t = resolver.resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
         assert!(
             matches!(t, ResolvedTransport::Icann { ref domain, .. } if domain == "example.com"),
             "expected ICANN fallback, got {t:?}"

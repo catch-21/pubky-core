@@ -113,6 +113,25 @@ impl Client {
         let value = JsFuture::from(promise).await.map_err(map_fetch_error)?;
         value.dyn_into::<Response>().map_err(PubkyError::from)
     }
+
+    /// Resolve a Pubky transport URL to its clearnet endpoint via PKARR (no session required).
+    ///
+    /// @param {string} url `https://_pubky.<z32>/…` or `https://<homeserver-z32>/…`
+    /// @returns {Promise<string>} Resolved URL (scheme/host/port/path) for use with external `fetch`.
+    #[wasm_bindgen(js_name = "resolveTransportUrl")]
+    pub async fn resolve_transport_url(&self, url: &str) -> JsResult<String> {
+        let mut url = Url::parse(url)?;
+
+        if url.scheme() == "pubky" {
+            return Err(PubkyError::new(
+                PubkyErrorName::InvalidInput,
+                "pubky:// URLs are not supported; resolve them before transport",
+            ));
+        }
+
+        self.0.prepare_request(&mut url).await?;
+        Ok(url.to_string())
+    }
 }
 
 fn map_fetch_error(err: JsValue) -> PubkyError {
@@ -185,6 +204,16 @@ mod tests {
             }
             other => panic!("expected InvalidRecord error, got {other:?}"),
         }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn resolve_transport_url_icann_is_unchanged() {
+        let client = Client::new(None).unwrap();
+        let resolved = client
+            .resolve_transport_url("https://example.com/foo")
+            .await
+            .unwrap();
+        assert_eq!(resolved, "https://example.com/foo");
     }
 
     // ICANN URL must not require pubky-host but should still allow credentials=include

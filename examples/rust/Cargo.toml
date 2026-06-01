@@ -41,6 +41,14 @@ path = "./7-events_stream/main.rs"
 name = "keygen"
 path = "./keygen.rs"
 
+[[bin]]
+name = "tor-proof-publish"
+path = "./tor-proof-publish/main.rs"
+
+[[bin]]
+name = "tor-proof-index"
+path = "./tor-proof-index/main.rs"
+
 [features]
 default = ["docker-postgres"]
 docker-postgres = ["pubky-testnet/docker-postgres"]
@@ -49,6 +57,7 @@ embedded-postgres = ["docker-postgres"]
 
 [dependencies]
 futures-util = "0.3.31"
+# tor-proof-index
 anyhow.workspace = true
 base64 = "0.22.1"
 clap = { version = "4.6.0", features = ["derive"] }

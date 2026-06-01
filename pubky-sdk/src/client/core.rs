@@ -52,6 +52,14 @@ pub struct PubkyHttpClientBuilder {
     /// The hostname to use for testnet URL transformations (WASM only).
     #[cfg(target_arch = "wasm32")]
     testnet_host: Option<String>,
+
+    /// SOCKS5 proxy URL for reaching `.onion` hosts (e.g. `"127.0.0.1:9050"`). Requires a running Tor daemon.
+    #[cfg(not(target_arch = "wasm32"))]
+    tor_socks_proxy: Option<String>,
+
+    /// When true, ignore direct Pubky TLS endpoints and use Tor onion SVCB only.
+    #[cfg(not(target_arch = "wasm32"))]
+    tor_only_transport: bool,
 }
 
 impl PubkyHttpClientBuilder {
@@ -176,6 +184,33 @@ impl PubkyHttpClientBuilder {
         self
     }
 
+    /// Route `.onion` pkarr endpoints through a Tor SOCKS5 proxy (native only).
+    ///
+    /// Example: `.tor_socks_proxy("127.0.0.1:9050")` with a local Tor daemon.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn tor_socks_proxy<S: Into<String>>(&mut self, proxy: S) -> &mut Self {
+        self.tor_socks_proxy = Some(proxy.into());
+        self
+    }
+
+    /// Ignore direct (IP) pkarr endpoints; use onion or ICANN fallback only.
+    ///
+    /// Use with [`Self::tor_socks_proxy`] for indexer-style clients that must not hit LAN IPs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub const fn tor_only_transport(&mut self, enabled: bool) -> &mut Self {
+        self.tor_only_transport = enabled;
+        self
+    }
+
+    /// Configure Tor SOCKS + tor-only transport and a long HTTP timeout (native only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn tor_indexer(&mut self, socks_proxy: &str) -> &mut Self {
+        self.tor_socks_proxy = Some(socks_proxy.to_string());
+        self.tor_only_transport = true;
+        self.request_timeout(Duration::from_secs(120));
+        self
+    }
+
     /// Build a [`PubkyHttpClient`].
     ///
     /// # Errors
@@ -219,6 +254,25 @@ impl PubkyHttpClientBuilder {
         #[cfg(not(target_arch = "wasm32"))]
         let mut icann_http_builder = reqwest::Client::builder().user_agent(user_agent.as_ref());
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut tor_http = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref proxy) = self.tor_socks_proxy {
+            let proxy_url = if proxy.starts_with("socks5://") {
+                proxy.clone()
+            } else {
+                format!("socks5h://{proxy}")
+            };
+            let mut tor_builder = reqwest::Client::builder()
+                .user_agent(user_agent.as_ref())
+                .proxy(reqwest::Proxy::all(&proxy_url).map_err(BuildError::Http)?);
+            if let Some(timeout) = self.http_request_timeout {
+                tor_builder = tor_builder.timeout(timeout);
+            }
+            tor_http = Some(tor_builder.build().map_err(BuildError::Http)?);
+            cross_log!(info, "PubkyHttpClient Tor SOCKS proxy enabled: {proxy_url}");
+        }
+
         // TODO: change this after Reqwest publish a release with timeout in wasm
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(timeout) = self.http_request_timeout {
@@ -234,7 +288,13 @@ impl PubkyHttpClientBuilder {
             icann_http: icann_http_builder.build()?,
 
             #[cfg(not(target_arch = "wasm32"))]
-            transport: super::http_targets::native::TransportResolver::new(),
+            tor_http,
+
+            #[cfg(not(target_arch = "wasm32"))]
+            transport: super::http_targets::native::TransportResolver::new(
+                self.tor_only_transport,
+                self.tor_socks_proxy.is_some(),
+            ),
 
             #[cfg(target_arch = "wasm32")]
             testnet_host: self.testnet_host.clone(),
@@ -335,6 +395,10 @@ pub struct PubkyHttpClient {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) icann_http: reqwest::Client,
+
+    /// HTTP client for `.onion` hosts via Tor SOCKS (present when `tor_socks_proxy` is set).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) tor_http: Option<reqwest::Client>,
 
     /// Resolves and caches per-host transport decisions (`PubkyTLS` vs ICANN fallback).
     #[cfg(not(target_arch = "wasm32"))]

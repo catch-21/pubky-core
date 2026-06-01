@@ -8,6 +8,8 @@
 use super::storage_config::StorageConfigToml;
 use super::{
     domain_port::DomainPort,
+    onion_address::OnionAddress,
+    pkdns_endpoint_mode::PkdnsEndpointMode,
     quota_config::{BandwidthQuota, PathLimit},
     storage_config::StorageToml,
     Domain, SignupMode,
@@ -24,7 +26,7 @@ use std::{
     fs,
     net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroU64},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 use url::Url;
@@ -51,15 +53,33 @@ pub enum ConfigReadError {
 
 /// Config structs
 
+/// PKDNS / pkarr publishing settings for the homeserver apex record.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct PkdnsToml {
+    /// Public IP advertised in direct SVCB hints and `A` records.
     pub public_ip: IpAddr,
+    /// Advertised Pubky TLS port (defaults to bind port).
     pub public_pubky_tls_port: Option<u16>,
+    /// Advertised ICANN HTTP port (defaults to bind port).
     pub public_icann_http_port: Option<u16>,
+    /// ICANN domain for browser HTTP fallback (e.g. reverse-proxy hostname).
     pub icann_domain: Option<Domain>,
+    /// Tor v3 hidden-service hostname advertised in pkarr (SVCB priority 20, least preferred).
+    pub tor_onion: Option<OnionAddress>,
+    /// Read onion hostname from this file (e.g. Tor `HiddenServiceDir/hostname`).
+    pub tor_onion_file: Option<PathBuf>,
+    /// Virtual port on the onion hidden service (maps to `icann_listen_socket` via Tor).
+    pub public_onion_http_port: Option<u16>,
+    /// `hybrid` (default): direct + optional ICANN + optional onion. `tor_only`: onion only.
+    #[serde(default)]
+    pub endpoint_mode: PkdnsEndpointMode,
+    /// Interval in seconds between user-key DHT republishes (`0` = disabled).
     pub user_keys_republisher_interval: u64,
+    /// Custom Mainline DHT bootstrap nodes (`host:port`).
     pub dht_bootstrap_nodes: Option<Vec<DomainPort>>,
+    /// pkarr HTTP relay URLs.
     pub dht_relay_nodes: Option<Vec<Url>>,
+    /// DHT request timeout in milliseconds.
     pub dht_request_timeout_ms: Option<NonZeroU64>,
 }
 
