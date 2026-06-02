@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use tokio::net::TcpStream;
 
+use crate::actors::pkdns::extract_host_from_packet;
 use crate::errors::RequestError;
 use crate::{PubkyHttpClient, PublicKey, Result, cross_log};
 use reqwest::{IntoUrl, Method, RequestBuilder};
@@ -22,6 +23,14 @@ pub(crate) enum ResolvedTransport {
 
 fn is_onion_host(domain: &str) -> bool {
     domain.ends_with(".onion")
+}
+
+#[derive(Default)]
+struct EndpointHints {
+    has_direct: bool,
+    direct_addrs: Vec<std::net::SocketAddr>,
+    onion: Option<(String, Option<u16>)>,
+    icann: Option<(String, Option<u16>)>,
 }
 
 /// Resolves and caches per-host transport decisions (`PubkyTLS` vs ICANN vs Tor onion).
@@ -86,28 +95,28 @@ impl TransportResolver {
 
     /// Inspect PKARR endpoints and probe reachability to pick a transport.
     async fn resolve_from_pkarr(&self, pkarr: &pkarr::Client, qname: &str) -> ResolvedTransport {
-        let stream = pkarr.resolve_https_endpoints(qname);
-        futures_util::pin_mut!(stream);
+        let mut hints = Self::collect_endpoint_hints(pkarr, qname, self.tor_only_transport).await;
 
-        let mut has_direct = false;
-        let mut direct_addrs = Vec::new();
-        let mut onion: Option<(String, Option<u16>)> = None;
-        let mut icann: Option<(String, Option<u16>)> = None;
-
-        while let Some(ep) = stream.next().await {
-            if let Some(domain) = ep.domain() {
-                if is_onion_host(domain) {
-                    if onion.is_none() {
-                        onion = Some((domain.to_string(), ep.port()));
+        // Hosted users publish `_pubky` → homeserver, not onion on their own apex packet.
+        if self.tor_only_transport && hints.onion.is_none() && hints.icann.is_none() {
+            if let Some(hs_z32) = Self::resolve_homeserver_z32(pkarr, qname).await {
+                if hs_z32 != qname {
+                    let hs_hints =
+                        Self::collect_endpoint_hints(pkarr, &hs_z32, self.tor_only_transport)
+                            .await;
+                    if hs_hints.onion.is_some() || hs_hints.icann.is_some() {
+                        hints = hs_hints;
                     }
-                } else if icann.is_none() {
-                    icann = Some((domain.to_string(), ep.port()));
                 }
-            } else if !self.tor_only_transport {
-                has_direct = true;
-                direct_addrs.extend(ep.to_socket_addrs());
             }
         }
+
+        let EndpointHints {
+            has_direct,
+            direct_addrs,
+            onion,
+            icann,
+        } = hints;
 
         if self.tor_only_transport {
             if let Some((domain, port)) = onion {
@@ -141,6 +150,40 @@ impl TransportResolver {
         }
         let (domain, port) = icann_pair;
         ResolvedTransport::Icann { domain, port }
+    }
+
+    async fn collect_endpoint_hints(
+        pkarr: &pkarr::Client,
+        qname: &str,
+        tor_only_transport: bool,
+    ) -> EndpointHints {
+        let stream = pkarr.resolve_https_endpoints(qname);
+        futures_util::pin_mut!(stream);
+
+        let mut hints = EndpointHints::default();
+
+        while let Some(ep) = stream.next().await {
+            if let Some(domain) = ep.domain() {
+                if is_onion_host(domain) {
+                    if hints.onion.is_none() {
+                        hints.onion = Some((domain.to_string(), ep.port()));
+                    }
+                } else if hints.icann.is_none() {
+                    hints.icann = Some((domain.to_string(), ep.port()));
+                }
+            } else if !tor_only_transport {
+                hints.has_direct = true;
+                hints.direct_addrs.extend(ep.to_socket_addrs());
+            }
+        }
+
+        hints
+    }
+
+    async fn resolve_homeserver_z32(pkarr: &pkarr::Client, user_pk: &str) -> Option<String> {
+        let user = PublicKey::try_from_z32(user_pk).ok()?;
+        let packet = pkarr.resolve(&user).await?;
+        extract_host_from_packet(&packet)
     }
 
     fn domain_fallback(
@@ -425,6 +468,52 @@ mod tests {
         let t = resolver.resolve_from_pkarr(&pkarr, &kp.public_key().to_string()).await;
         assert!(
             matches!(t, ResolvedTransport::Onion { ref domain, port: Some(80) } if domain == ONION)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_transport_tor_mode_follows_pubky_homeserver_onion() {
+        const ONION: &str =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.onion";
+        let user = Keypair::random();
+        let homeserver = Keypair::random();
+
+        let mut hs_onion = SVCB::new(20, ONION.try_into().unwrap());
+        hs_onion.set_port(80);
+        let hs_packet = SignedPacket::builder()
+            .https(".".try_into().unwrap(), hs_onion, 3600)
+            .sign(&homeserver)
+            .unwrap();
+
+        let hs_z32 = homeserver.public_key().to_z32();
+        let pubky_record = SVCB::new(
+            1,
+            hs_z32.as_str().try_into().expect("homeserver z32 as SVCB target"),
+        );
+        let user_packet = SignedPacket::builder()
+            .https("_pubky".try_into().unwrap(), pubky_record, 3600)
+            .sign(&user)
+            .unwrap();
+
+        let mut builder = PubkyHttpClient::builder();
+        builder.pkarr(|b| b.no_default_network().bootstrap(&["127.0.0.1:1"]));
+        let client = builder.build().unwrap();
+        let cache = client.pkarr.cache().unwrap();
+        cache.put(
+            &pkarr::PublicKey::from(user.public_key()).into(),
+            &user_packet,
+        );
+        cache.put(
+            &pkarr::PublicKey::from(homeserver.public_key()).into(),
+            &hs_packet,
+        );
+        let resolver = TransportResolver::new(true, true);
+        let t = resolver
+            .resolve_from_pkarr(client.pkarr(), &user.public_key().to_z32())
+            .await;
+        assert!(
+            matches!(t, ResolvedTransport::Onion { ref domain, port: Some(80) } if domain == ONION),
+            "expected homeserver onion via _pubky fallback, got {t:?}"
         );
     }
 

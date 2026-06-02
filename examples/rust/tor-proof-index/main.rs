@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use pubky::{Pubky, PubkyHttpClient, PublicKey};
+use pubky::{Pubky, PubkyHttpClient, PubkyResource, PublicKey};
 use reqwest::Method;
 use url::Url;
 
@@ -90,24 +90,55 @@ async fn main() -> Result<()> {
         .collect();
 
     println!("Received {} event line(s)", lines.len());
+    for line in &lines {
+        println!("  {line}");
+    }
 
     let mut fetched = 0u32;
     for line in &lines {
-        if !line.starts_with("pubky://") {
+        if let Some(cursor) = line.strip_prefix("cursor:") {
+            println!("Next cursor: {}", cursor.trim());
             continue;
         }
-        let transport = pubky::resolve_pubky(line).context("resolve pubky URI")?;
-        println!("Fetching {line} -> {transport}");
+        let Some((op, uri)) = line.split_once(' ') else {
+            println!("Skipping unrecognized line: {line}");
+            continue;
+        };
+        if op != "PUT" {
+            println!("Skipping {op}: {uri}");
+            continue;
+        }
+        let resource: PubkyResource = uri.parse().context("parse pubky URI from event")?;
+        if resource.owner != user {
+            println!(
+                "Skipping event for other user: {}",
+                resource.to_pubky_url()
+            );
+            continue;
+        }
+        let fetch_url = resource
+            .to_transport_url()
+            .context("build transport URL for resource")?;
+        println!(
+            "Fetching {} over Tor -> {fetch_url}",
+            resource.to_pubky_url()
+        );
         let resp = client
-            .cross_request(Method::GET, transport)
+            .cross_request(Method::GET, fetch_url)
             .await?
             .send()
             .await
-            .with_context(|| format!("fetch {line}"))?;
+            .with_context(|| format!("fetch {}", resource.to_pubky_url()))?;
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let preview: String = text.chars().take(120).collect();
-        println!("  HTTP {code} ({} bytes): {preview:?}", text.len());
+        if !code.is_success() {
+            bail!(
+                "fetch {} failed: HTTP {code} body={text:?}",
+                resource.to_pubky_url()
+            );
+        }
+        println!("  HTTP {code} ({} bytes)", text.len());
+        println!("  content: {text}");
         fetched += 1;
     }
 

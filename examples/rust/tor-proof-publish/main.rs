@@ -26,7 +26,7 @@ struct Cli {
     path: String,
 
     /// File content
-    #[arg(short, long, default_value = "hello from tor-proof-publish")]
+    #[arg(short, long, default_value = "hello world! from tor-proof-publish")]
     content: String,
 }
 
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     println!("user_z32={}", user_pk.z32());
     println!("resource_uri={uri}");
     println!();
-    println!("Next: wait ~1-2 min for DHT, then run tor-proof-index with the z32 keys above.");
+    println!("Next: wait a few seconds for DHT to propagate, then run tor-proof-index with the z32 keys above.");
 
     Ok(())
 }

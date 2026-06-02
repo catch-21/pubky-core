@@ -2,6 +2,33 @@
 
 This guide proves end-to-end reachability using the **real Tor network** and **live Mainline DHT**. All tooling lives in the **pubky-core** repository.
 
+## Retrieval flow (`tor-proof-index`)
+
+Two phases: **resolve** where the homeserver is (clearnet pkarr), then **fetch** with plain **HTTP** to `http://….onion/…` via local **SOCKS5** (`socks5h://127.0.0.1:9050`).
+
+```mermaid
+flowchart TB
+  C["Client<br/>tor-proof-index / SDK"]
+
+  P["pkarr / DHT<br/>clearnet — not Tor"]
+
+  TOR["Tor daemon<br/>SOCKS5 127.0.0.1:9050"]
+  HS["Homeserver<br/>HTTP :6286 via .onion :80"]
+
+  C -->|① resolve| P
+  P -->|".onion" + _pubky"| C
+
+  C -->|"② HTTP request<br/>socks5h"| TOR
+  TOR -->|"http://….onion/…"| HS
+  HS -->|"HTTP response"| TOR
+  TOR -->|"events + files"| C
+
+  style TOR fill:#ffe8a3,stroke:#b8860b,color:#000
+```
+
+- **Publish** (`tor-proof-publish`) uses only ① on LAN (hybrid pkarr), not Tor.
+- **Onion in pkarr** is published by the homeserver; see [tor-endpoints.md](./tor-endpoints.md).
+
 ## Tor is not bundled with the homeserver
 
 You must install and run **Tor separately**. The homeserver only reads your `.onion` hostname and publishes it in pkarr.
@@ -14,24 +41,63 @@ You must install and run **Tor separately**. The homeserver only reads your `.on
 | Debian/Ubuntu | `sudo apt install tor` then `sudo systemctl enable --now tor` |
 | Umbrel | Use the Tor service included in the Umbrel stack |
 
-### Configure hidden service + SOCKS
+### Configure hidden service
 
-Add to your `torrc` (path varies, e.g. `/opt/homebrew/etc/tor/torrc` or `/etc/tor/torrc`):
+Tor’s default **SOCKS port is already 9050** — you do not need to set `SocksPort` in `torrc`.
+
+Pick a `HiddenServiceDir` path Tor can write to, create it with permission mode **700**, then add only these lines to `torrc`:
+
+| Platform | Typical `torrc` path | Example `HiddenServiceDir` |
+|----------|----------------------|----------------------------|
+| macOS (Homebrew) | `/opt/homebrew/etc/tor/torrc` | `/opt/homebrew/var/lib/tor/pubky-homeserver/` |
+| Linux | `/etc/tor/torrc` | `/var/lib/tor/pubky-homeserver/` |
 
 ```text
-SocksPort 9050
-HiddenServiceDir /var/lib/tor/pubky-homeserver/
+HiddenServiceDir /opt/homebrew/var/lib/tor/pubky-homeserver/
 HiddenServicePort 80 127.0.0.1:6286
 ```
 
-Reload Tor, then read the onion hostname:
+(Use the Linux paths on Debian/Ubuntu if you prefer.)
+
+**Create the directory and set permissions** (adjust the path to match your `torrc`):
 
 ```bash
-sudo systemctl reload tor   # or: brew services restart tor
+# macOS (Homebrew) example
+sudo mkdir -p /opt/homebrew/var/lib/tor/pubky-homeserver
+sudo chown "$(whoami)" /opt/homebrew/var/lib/tor/pubky-homeserver
+chmod 700 /opt/homebrew/var/lib/tor/pubky-homeserver
+
+# Linux example
+sudo mkdir -p /var/lib/tor/pubky-homeserver
+sudo chown debian-tor:debian-tor /var/lib/tor/pubky-homeserver   # user may be _tor on some distros
+sudo chmod 700 /var/lib/tor/pubky-homeserver
+```
+
+**Restart Tor** after editing `torrc`:
+
+```bash
+# macOS
+brew services restart tor
+
+# Linux
+sudo systemctl restart tor
+```
+
+Read the generated onion hostname (path must match `HiddenServiceDir`):
+
+```bash
+# macOS (Homebrew)
+cat /opt/homebrew/var/lib/tor/pubky-homeserver/hostname
+
+# Linux
 cat /var/lib/tor/pubky-homeserver/hostname
 ```
 
+Point `tor_onion_file` in homeserver config at that `hostname` file.
+
 ### Verify Tor before the proof
+
+SOCKS is on the default port **9050**:
 
 ```bash
 curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
@@ -47,7 +113,7 @@ In `~/.pubky/config.toml` (or your data directory):
 [pkdns]
 public_ip = "127.0.0.1"
 icann_domain = "localhost"
-tor_onion_file = "/var/lib/tor/pubky-homeserver/hostname"
+tor_onion_file = "/opt/homebrew/var/lib/tor/pubky-homeserver/hostname"  # macOS Homebrew; see paths above
 # or: tor_onion = "your....onion"
 public_onion_http_port = 80
 endpoint_mode = "hybrid"
@@ -88,7 +154,7 @@ This script:
 1. Preflights Tor SOCKS (`127.0.0.1:9050`)
 2. Resolves the homeserver `.onion` from **live DHT**
 3. Verifies `user` → `_pubky` → `homeserver`
-4. Polls `GET /events/` and fetches `pubky://` resources **only via Tor**
+4. Polls `GET /events/` (lines like `PUT pubky://…`) and fetches file bodies **only via Tor** (`https://_pubky.<user>/…`; SDK follows `_pubky` to the homeserver’s onion and sets `pubky-host` to the user)
 
 **Strong proof:** run step 3 on another machine that only knows the z32 keys (not your LAN IP).
 
@@ -96,7 +162,8 @@ This script:
 
 | Problem | Check |
 |---------|--------|
-| SOCKS preflight fails | `tor` running? `SocksPort 9050`? |
+| SOCKS preflight fails | `tor` running? default SOCKS on `127.0.0.1:9050`? |
+| Tor fails to start after HS config | `HiddenServiceDir` exists and is mode **700**? `brew services restart tor` (macOS) |
 | No onion in DHT | `tor_onion` set? homeserver publish log? wait longer |
 | Signup fails | homeserver up? `signup_mode` / token? hybrid `localhost` pkarr |
 | Events empty | run publish script first; check path under `/pub/tor-proof/` |
