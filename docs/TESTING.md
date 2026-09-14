@@ -127,15 +127,26 @@ docker run --rm --network none pubky-testnet:release homeserver --help
 
 ### Docker builds in CI
 
-All Docker jobs use the shared [build workflow](../.github/workflows/docker-build.yml) for both targets:
+All Docker jobs use the shared [build workflow](../.github/workflows/docker-build.yml)
+to build both `homeserver` and `testnet` images.
 
 | Workflow | Trigger | Profile | Platforms | Publishes images |
 | --- | --- | --- | --- | --- |
-| [PR Check](../.github/workflows/pr-check.yml) | Pull requests and pushes to `main` | `debug` | `linux/amd64` | No |
-| [Release Docker check](../.github/workflows/docker-check.yml) | Pushes to `main` | `release` | `linux/amd64`, `linux/arm64` | No |
+| [PR Check](../.github/workflows/pr-check.yml) | Pull requests and pushes to `main` | `debug` | `linux/amd64` (native runner) | No |
+| [Release Docker check](../.github/workflows/docker-check.yml) | Pushes to `main` | `release` | `linux/amd64`, `linux/arm64` (native runners) | No |
 | [Docker publishing](../.github/workflows/docker.yml) | Tags matching `v*` | `release` | `linux/amd64`, `linux/arm64` | Yes |
 
-Build caches are scoped by profile and target.
+Callers must specify `build_profile`. Native checks default to `architecture: amd64`
+and `publish: false`; setting `publish: true` builds and publishes both architectures.
+The shared workflow derives runners, platforms, and cache scopes from these inputs.
+
+Checks use native runners: `ubuntu-24.04` for AMD64 and `ubuntu-24.04-arm` for ARM64.
+ARM64 is checked only after merging to `main`. Publishing runs on `ubuntu-latest`
+with ARM64 emulation.
+
+Caches use the scope `docker-<profile>-<target>-<architecture>`. Checks import and
+update their cache, with debug builds on `main` warming caches for PRs. Publishing
+imports both architecture-specific release caches from `main` without exporting.
 
 ## Common Commands
 

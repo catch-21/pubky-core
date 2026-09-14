@@ -9,6 +9,10 @@ permissions:
 
 jobs:
   build:
+    strategy:
+      matrix:
+        architecture: [amd64, arm64]
     uses: ./.github/workflows/docker-build.yml
     with:
-      publish: false
+      build_profile: release
+      architecture: ${{ matrix.architecture }}

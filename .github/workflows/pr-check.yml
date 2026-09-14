@@ -330,5 +330,3 @@ jobs:
     uses: ./.github/workflows/docker-build.yml
     with:
       build_profile: debug
-      platforms: linux/amd64
-      publish: false
