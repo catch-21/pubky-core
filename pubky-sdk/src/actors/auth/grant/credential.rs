@@ -41,6 +41,8 @@ use crate::{
 pub(crate) const REFRESH_SLACK_SECS: u64 = 300;
 
 const GRANT_SESSION_PATH: &str = "/auth/grant/session";
+/// JWS `typ` prefix reserved for Pubky authentication; application signing refuses it.
+const RESERVED_JWS_TYP_PREFIX: &str = "pubky-";
 const STORED_GRANT_CREDENTIAL_PREFIX: &str = "pubky-grant-credential-v1";
 const STORED_GRANT_CREDENTIAL_PREFIX_FAMILY: &str = "pubky-grant-credential-";
 
@@ -227,6 +229,46 @@ impl GrantCredential {
     /// Snapshot of the current bearer token (released immediately).
     pub(crate) async fn current_bearer(&self) -> String {
         self.state.lock().await.bearer.clone()
+    }
+
+    /// The user-signed grant JWS backing this credential.
+    ///
+    /// Applications embed it where a counterparty must verify, offline, that
+    /// the grant's `cnf` key acts for its `iss` — for example a protocol that
+    /// uses the grant client key to sign records in the user's name.
+    pub async fn grant_jws(&self) -> String {
+        self.state.lock().await.grant_jws.clone()
+    }
+
+    /// The grant client key: the `cnf` claim, which signs `PoP` proofs and
+    /// anything produced by [`Self::sign_jws`].
+    pub async fn client_public_key(&self) -> PublicKey {
+        self.state.lock().await.client_signer.public_key()
+    }
+
+    /// Sign arbitrary claims as a JWS with the grant client key.
+    ///
+    /// Produces `base64url(header).base64url(claims).base64url(signature)`
+    /// with header `{"alg":"EdDSA","typ":<typ>}`, dispatching to the local
+    /// keypair or the delegated (browser-held) signer — the same path the
+    /// SDK uses for its own `PoP` proofs.
+    ///
+    /// The `pubky-*` `typ` namespace is reserved for Pubky authentication
+    /// (`pubky-grant`, `pubky-pop`) and is refused: nothing an application
+    /// signs with this method can be presented to a homeserver as a proof.
+    ///
+    /// # Errors
+    /// - Returns [`AuthError::Validation`] if `typ` is in the reserved namespace.
+    /// - Propagates delegated signer failures.
+    pub async fn sign_jws<T: serde::Serialize>(&self, typ: &str, claims: &T) -> Result<String> {
+        if typ.starts_with(RESERVED_JWS_TYP_PREFIX) {
+            return Err(AuthError::Validation(format!(
+                "JWS typ {typ:?} is in the reserved `{RESERVED_JWS_TYP_PREFIX}*` namespace"
+            ))
+            .into());
+        }
+        let signer = self.state.lock().await.client_signer.clone();
+        signer.sign_jws(typ, claims).await
     }
 
     /// Export the portable local secret material needed to restore this credential.
@@ -622,6 +664,39 @@ mod tests {
             .to_string();
 
         assert!(error.contains("has expired"));
+    }
+
+    #[tokio::test]
+    async fn sign_jws_signs_with_the_client_key_and_refuses_reserved_typs() {
+        let (stored, claims) = stored_credential(now_unix() + 3600);
+        let client_keypair = Keypair::from_secret(&stored.client_key_secret);
+        let credential = test_credential(
+            stored.clone(),
+            claims.clone(),
+            GrantPopSigner::local(client_keypair.clone()),
+        );
+
+        assert_eq!(credential.grant_jws().await, stored.grant_jws);
+        assert_eq!(
+            credential.client_public_key().await,
+            client_keypair.public_key()
+        );
+
+        let payload = serde_json::json!({ "seq": 7, "kind": "move" });
+        let jws = credential.sign_jws("example-link", &payload).await.unwrap();
+        assert_eq!(
+            jws,
+            pubky_common::auth::jws::sign_jws(&client_keypair, "example-link", &payload)
+        );
+
+        for reserved in ["pubky-pop", "pubky-grant", "pubky-anything"] {
+            let error = credential
+                .sign_jws(reserved, &payload)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reserved"), "{reserved}: {error}");
+        }
     }
 
     #[tokio::test]

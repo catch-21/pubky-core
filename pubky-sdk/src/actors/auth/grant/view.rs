@@ -77,6 +77,34 @@ impl<'a> GrantSessionView<'a> {
         self.credential.state.lock().await.grant_claims.jti.clone()
     }
 
+    /// The user-signed grant JWS backing this session. See
+    /// [`GrantCredential::grant_jws`].
+    pub async fn grant_jws(&self) -> String {
+        self.credential.grant_jws().await
+    }
+
+    /// The grant client key (`cnf`). See [`GrantCredential::client_public_key`].
+    pub async fn client_public_key(&self) -> pubky_common::crypto::PublicKey {
+        self.credential.client_public_key().await
+    }
+
+    /// Sign arbitrary claims as a JWS with the grant client key. See
+    /// [`GrantCredential::sign_jws`]; the `pubky-*` `typ` namespace is refused.
+    ///
+    /// # Errors
+    /// - See [`GrantCredential::sign_jws`].
+    pub async fn sign_jws<T: serde::Serialize>(&self, typ: &str, claims: &T) -> Result<String> {
+        self.credential.sign_jws(typ, claims).await
+    }
+
+    /// A clone of the underlying credential, for callers that need to sign
+    /// outside the session's lifetime (the credential shares its state with
+    /// the session, so refreshes remain visible to both).
+    #[must_use]
+    pub fn credential(&self) -> GrantCredential {
+        self.credential.clone()
+    }
+
     /// Test/debug helper: force a refresh of the credential right now.
     ///
     /// Used by integration tests to verify that a refresh yields a new
